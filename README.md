@@ -62,39 +62,6 @@ python3 -m http.server 8080
 npx serve .
 ```
 
----
-
-## 上传 GitHub 前的自定义清单
-
-将以下占位内容替换为你的真实信息：
-
-1. **首页信息** (`js/router.js` → `pages.home`)
-   - 职位标题、统计数字
-
-2. **关于我** (`js/router.js` → `pages.about`)
-   - 个人简介、技能标签、技能百分比
-
-3. **项目展示** (`js/router.js` → `pages.projects`)
-   - 项目名称、描述、技术标签、预览链接、源码链接
-
-4. **工作经历** (`js/router.js` → `pages.experience`)
-   - 时间、公司、职位、工作描述
-
-5. **联系方式** (`js/router.js` → `pages.contact`)
-   - 邮箱、GitHub、LinkedIn 等社交链接
-
-6. **头像** (`js/router.js` → `pages.home`)
-   - 将 `.hero-avatar` 中的文字替换为 `<img>` 或使用你的 Logo
-
----
-
-## 演示截图建议
-
-为了让你在 GitHub 上获得更好的展示效果，建议上传以下截图到仓库的 `screenshots/` 目录，并在 README 中引用：
-
-- 桌面端首页亮/暗主题
-- 移动端响应式效果
-- 项目筛选交互过程
 
 ---
 

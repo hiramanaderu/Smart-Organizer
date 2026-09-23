@@ -1,6 +1,9 @@
 """文件整理器：按规则分类整理文件，支持预览与撤销."""
 
 import json
+import hashlib
+import os
+import uuid
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -73,20 +76,25 @@ def build_plan(
     target = Path(target_dir).expanduser().resolve()
     plan = OrganizePlan(strategy=strategy, target_dir=target)
 
+    reserved = set()
     for f in scan_result.files:
         folder_name = _resolve_folder(f, strategy)
         dst_dir = target / folder_name
         dst = dst_dir / f.name
 
-        # 处理重名
+        if f.path.resolve() == dst.resolve():
+            continue
+
+        # 预览与执行使用同一计划，同时保留本批次的目标路径。
         counter = 1
         original_dst = dst
-        while dst.exists() and not dry_run:
+        while os.path.lexists(dst) or os.path.normcase(str(dst)) in reserved:
             stem = original_dst.stem
             suffix = original_dst.suffix
             dst = dst_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
+        reserved.add(os.path.normcase(str(dst)))
         plan.actions.append(
             MoveAction(
                 src=f.path,
@@ -101,87 +109,125 @@ def build_plan(
     return plan
 
 
-def execute_plan(plan: OrganizePlan, log_dir: str = "./logs") -> Path:
-    """执行整理计划并生成撤销日志.
+def _fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    Returns:
-        撤销日志文件路径
-    """
+
+def _write_log(path: Path, data: dict) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def _move_without_overwrite(src: Path, dst: Path, fingerprint: str) -> None:
+    """独占创建目标文件；复制成功且源文件未变化后才删除源文件。"""
+    if src.is_symlink() or not src.is_file():
+        raise OSError(f"源文件不是普通文件: {src}")
+    if _fingerprint(src) != fingerprint:
+        raise OSError(f"源文件内容已改变: {src}")
+    created = False
+    try:
+        with src.open("rb") as reader, dst.open("xb") as writer:
+            created = True
+            shutil.copyfileobj(reader, writer)
+            writer.flush()
+            os.fsync(writer.fileno())
+        shutil.copystat(src, dst)
+        if _fingerprint(dst) != fingerprint or _fingerprint(src) != fingerprint:
+            raise OSError("复制过程中内容发生变化，已保留源文件")
+        src.unlink()
+    except BaseException:
+        if created and src.exists():
+            dst.unlink(missing_ok=True)
+        raise
+
+
+def execute_plan(plan: OrganizePlan, log_dir: str = "./logs") -> Path:
+    """逐项记录移动状态；部分失败时保留可恢复日志。"""
     log_path = Path(log_dir).expanduser().resolve()
     log_path.mkdir(parents=True, exist_ok=True)
-
-    # 创建目标目录
-    for d in plan.created_dirs:
-        d.mkdir(parents=True, exist_ok=True)
-
-    # 执行移动
-    executed: List[dict] = []
-    for action in plan.actions:
-        try:
-            shutil.move(str(action.src), str(action.dst))
-            executed.append({
-                "src": str(action.src),
-                "dst": str(action.dst),
-                "original_name": action.original_name,
-            })
-        except (OSError, shutil.Error) as e:
-            raise RuntimeError(f"移动失败 {action.src} -> {action.dst}: {e}")
-
-    # 写入撤销日志
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_path / f"undo_{timestamp}.json"
-    with open(log_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "timestamp": timestamp,
-                "strategy": plan.strategy.value,
-                "actions": executed,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_file = log_path / f"undo_{timestamp}_{uuid.uuid4().hex}.json"
+    data = {"timestamp": timestamp, "strategy": plan.strategy.value,
+            "status": "running", "actions": []}
+    _write_log(log_file, data)
+    try:
+        for action in plan.actions:
+            action.dst.parent.mkdir(parents=True, exist_ok=True)
+            record = {"src": str(action.src), "dst": str(action.dst),
+                      "original_name": action.original_name,
+                      "sha256": _fingerprint(action.src), "status": "pending"}
+            data["actions"].append(record)
+            _write_log(log_file, data)
+            _move_without_overwrite(action.src, action.dst, record["sha256"])
+            record["status"] = "moved"
+            _write_log(log_file, data)
+        data["status"] = "complete"
+        _write_log(log_file, data)
+    except Exception as error:
+        data["status"] = "failed"
+        data["error"] = str(error)
+        _write_log(log_file, data)
+        raise RuntimeError(f"整理未完成，恢复日志: {log_file}: {error}") from error
     return log_file
 
 
 def undo(log_file: Path) -> int:
-    """根据日志撤销整理操作.
-
-    Returns:
-        成功恢复的文件数量
-    """
-    if not log_file.exists():
-        raise FileNotFoundError(f"日志文件不存在: {log_file}")
-
-    with open(log_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+    """恢复成功后逐项记账，冲突或内容改变时保留日志供重试。"""
+    with log_file.open(encoding="utf-8") as stream:
+        data = json.load(stream)
     restored = 0
+    errors = []
     for action in reversed(data.get("actions", [])):
-        src = Path(action["dst"])
-        dst = Path(action["src"])
+        if action.get("status") in ("restored", "skipped"):
+            continue
+        src, dst = Path(action["dst"]), Path(action["src"])
         try:
+            if action.get("status") == "pending" and dst.exists():
+                # 移动未完成，原文件还在；不删除目标处可能存在的文件。
+                action["status"] = "skipped"
+                _write_log(log_file, data)
+                continue
+            if action.get("status") == "restoring" and not src.exists() and dst.is_file():
+                if _fingerprint(dst) == action.get("sha256"):
+                    action["status"] = "restored"
+                    _write_log(log_file, data)
+                    continue
+            if src.is_symlink():
+                raise OSError(f"拒绝恢复符号链接: {src}")
+            fingerprint = action.get("sha256") or _fingerprint(src)
+            action["sha256"] = fingerprint
+            action["status"] = "restoring"
+            _write_log(log_file, data)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+            _move_without_overwrite(src, dst, fingerprint)
+            action["status"] = "restored"
             restored += 1
-        except (OSError, shutil.Error):
-            pass
-
-    # 重命名日志，标记已撤销
-    undone_name = log_file.with_suffix(".undone.json")
-    log_file.rename(undone_name)
+            _write_log(log_file, data)
+        except (OSError, shutil.Error) as error:
+            errors.append(str(error))
+    if errors:
+        data["status"] = "restore_failed"
+        data["errors"] = errors
+        _write_log(log_file, data)
+        raise RuntimeError(f"已恢复 {restored} 个文件，其余需重试；日志: {log_file}; " + "; ".join(errors))
+    data["status"] = "undone"
+    _write_log(log_file, data)
+    log_file.rename(log_file.with_suffix(".undone.json"))
     return restored
 
 
 def list_undo_logs(log_dir: str = "./logs") -> List[Path]:
-    """列出可用的撤销日志."""
     log_path = Path(log_dir).expanduser().resolve()
-    if not log_path.exists():
-        return []
-    return sorted(
-        [f for f in log_path.glob("undo_*.json") if f.suffix != ".undone"],
-        reverse=True,
-    )
+    return sorted((f for f in log_path.glob("undo_*.json")
+                   if not f.name.endswith(".undone.json")), reverse=True)
 
 
 def _resolve_folder(f: FileInfo, strategy: Strategy) -> str:
@@ -205,3 +251,4 @@ def _resolve_folder(f: FileInfo, strategy: Strategy) -> str:
         else:
             return "超大文件_500MB以上"
     return "其他"
+

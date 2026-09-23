@@ -19,7 +19,7 @@ def find_duplicates(
 
     Args:
         scan_result: 扫描结果
-        quick_mode: 为 True 时只取前 8KB 计算部分哈希，适合大文件快速筛查
+        quick_mode: 为 True 时先以头部哈希筛选，再完整校验内容
         size_filter: 是否先用大小预过滤
 
     Returns:
@@ -34,23 +34,52 @@ def find_duplicates(
     for f in files:
         size_groups[f.size].append(f)
 
-    # 阶段 2：对大小相同的文件计算 MD5
-    md5_groups: Dict[str, List[FileInfo]] = defaultdict(list)
-
+    # 部分哈希只用于缩小候选集，不作为内容相同的最终依据。
+    candidates = defaultdict(list)
     for size, group in size_groups.items():
         if size_filter and len(group) < 2:
-            continue  # 唯一大小不可能是重复
+            continue
         for f in group:
-            if quick_mode and f.size > 8192:
-                md5 = _partial_md5(f.path)
-            else:
-                md5 = f.compute_md5()
-            if md5:
-                md5_groups[md5].append(f)
+            digest = _partial_md5(f.path) if quick_mode else "full"
+            if digest:
+                candidates[(size, digest)].append(f)
 
-    # 过滤出真正有重复的组
-    duplicates = {md5: group for md5, group in md5_groups.items() if len(group) > 1}
+    duplicates = {}
+    for group in candidates.values():
+        if len(group) < 2:
+            continue
+        verified = defaultdict(list)
+        for f in group:
+            digest = f.compute_md5()
+            if digest:
+                verified[digest].append(f)
+        # 相同完整哈希后仍逐字节比较，避免哈希碰撞。
+        for digest, matches in verified.items():
+            partitions = []
+            for f in matches:
+                for partition in partitions:
+                    if _same_content(f.path, partition[0].path):
+                        partition.append(f)
+                        break
+                else:
+                    partitions.append([f])
+            for index, partition in enumerate(partitions):
+                if len(partition) > 1:
+                    duplicates[f"{partition[0].size}:{digest}:{index}"] = partition
     return duplicates
+
+
+def _same_content(left, right) -> bool:
+    try:
+        with left.open("rb") as a, right.open("rb") as b:
+            while True:
+                chunk = a.read(1024 * 1024)
+                if chunk != b.read(1024 * 1024):
+                    return False
+                if not chunk:
+                    return True
+    except OSError:
+        return False
 
 
 def _partial_md5(path, chunk_size: int = 8192) -> str:
@@ -81,3 +110,4 @@ def duplicate_summary(duplicates: Dict[str, List[FileInfo]]) -> dict:
         "wasted_space": wasted_space,
         "wasted_space_label": human_readable_size(wasted_space),
     }
+
